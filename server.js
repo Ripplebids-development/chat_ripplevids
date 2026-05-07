@@ -33,6 +33,14 @@ const STORAGE_DIRS = {
     documents: path.join(MEDIA_BASE_DIR, 'documents')
 };
 
+// Map singular to plural for convenience
+const TYPE_TO_DIR = {
+    image: 'images',
+    video: 'videos',
+    voice: 'voice',
+    document: 'documents'
+};
+
 // Ensure directories exist
 Object.values(STORAGE_DIRS).forEach(dir => {
     if (!fs.existsSync(dir)) {
@@ -45,18 +53,28 @@ app.use('/media', express.static(MEDIA_BASE_DIR));
 
 // Configure multer for file uploads
 const fileFilter = (req, file, cb) => {
-    const allowedTypes = {
-        image: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
-        video: ['video/mp4', 'video/quicktime'],
-        voice: ['audio/mp4', 'audio/mpeg', 'audio/ogg'],
-        document: ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain']
-    };
+    // Allow all file types that we support
+    const allowedMimeTypes = [
+        // Images
+        'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+        // Videos
+        'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
+        // Audio/Voice
+        'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/webm',
+        // Documents
+        'application/pdf', 
+        'application/msword', 
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'text/plain',
+        'text/csv'
+    ];
 
-    const type = req.body.type || 'image';
-    if (allowedTypes[type] && allowedTypes[type].includes(file.mimetype)) {
+    if (allowedMimeTypes.includes(file.mimetype)) {
         cb(null, true);
     } else {
-        cb(new Error(`Invalid file type for ${type}`), false);
+        cb(new Error(`Unsupported file type: ${file.mimetype}`), false);
     }
 };
 
@@ -117,21 +135,35 @@ async function saveMessage(conversationId, senderId, body, type = 'text', mediaU
         let metadata = {};
         if (mediaData) {
             metadata = {
-                width: mediaData.width,
-                height: mediaData.height,
-                duration: mediaData.duration,
-                size: mediaData.size
+                width: mediaData.width || null,
+                height: mediaData.height || null,
+                duration: mediaData.duration || null,
+                size: mediaData.size || null
             };
         }
 
+        // Convert undefined to null for all parameters
         await db.execute(
             `INSERT INTO ripplevids_messages 
             (id, conversation_id, sender_id, body, type, created_at, media_url, media_type, media_size_bytes, 
              media_duration_seconds, media_width, media_height, metadata, reply_to_message_id) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [messageId, conversationId, senderId, body, type, createdAt, mediaUrl, 
-             mediaData?.mimeType, mediaData?.size, mediaData?.duration, mediaData?.width, 
-             mediaData?.height, JSON.stringify(metadata), replyToMessageId]
+            [
+                messageId, 
+                conversationId, 
+                senderId, 
+                body || '', 
+                type, 
+                createdAt, 
+                mediaUrl || null, 
+                mediaData?.mimeType || null, 
+                mediaData?.size || null, 
+                mediaData?.duration || null, 
+                mediaData?.width || null, 
+                mediaData?.height || null, 
+                JSON.stringify(metadata), 
+                replyToMessageId || null
+            ]
         );
 
         // Update conversation last message
@@ -150,14 +182,19 @@ async function saveMessage(conversationId, senderId, body, type = 'text', mediaU
 
 async function getMessages(conversationId, limit = 50, offset = 0) {
     try {
+        // Ensure limit and offset are valid integers
+        const validLimit = Math.max(1, Math.min(parseInt(limit) || 50, 100));
+        const validOffset = Math.max(0, parseInt(offset) || 0);
+
+        // Use string interpolation for LIMIT/OFFSET as some MySQL versions don't support placeholders for these
         const [messages] = await db.execute(`
             SELECT m.*, 
                    (SELECT COUNT(*) FROM message_reads WHERE message_id = m.id) as read_count
             FROM ripplevids_messages m
             WHERE m.conversation_id = ? AND m.is_deleted = FALSE
             ORDER BY m.created_at DESC
-            LIMIT ? OFFSET ?
-        `, [conversationId, parseInt(limit), parseInt(offset)]);
+            LIMIT ${validLimit} OFFSET ${validOffset}
+        `, [conversationId]);
 
         return messages.reverse();
     } catch (error) {
@@ -202,8 +239,20 @@ async function canSendMessage(userId, conversationId) {
  */
 app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
     try {
-        const { type = 'image', conversationId } = req.body;
+        console.log('Upload request received:', {
+            body: req.body,
+            bodyKeys: Object.keys(req.body || {}),
+            file: req.file ? {
+                originalname: req.file.originalname,
+                mimetype: req.file.mimetype,
+                size: req.file.size
+            } : null
+        });
+
         const file = req.file;
+        let { type, conversationId } = req.body;
+
+        console.log('Raw type value:', type, 'Type of type:', typeof type);
 
         if (!file) {
             return res.status(400).json({ success: false, error: 'No file provided' });
@@ -212,6 +261,22 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
         if (!conversationId) {
             return res.status(400).json({ success: false, error: 'Conversation ID required' });
         }
+
+        // Determine type from mimetype if not provided or invalid
+        if (!type || type === 'undefined' || type === 'null') {
+            console.log('Type not provided, determining from mimetype:', file.mimetype);
+            if (file.mimetype.startsWith('image/')) {
+                type = 'image';
+            } else if (file.mimetype.startsWith('video/')) {
+                type = 'video';
+            } else if (file.mimetype.startsWith('audio/')) {
+                type = 'voice';
+            } else {
+                type = 'document';
+            }
+        }
+
+        console.log('Final determined type:', type);
 
         // Validate file type
         const allowedSizes = {
@@ -225,11 +290,20 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
             return res.status(400).json({ success: false, error: `File too large for ${type}` });
         }
 
+        // Map type to directory name (singular to plural)
+        const dirKey = TYPE_TO_DIR[type];
+        if (!dirKey || !STORAGE_DIRS[dirKey]) {
+            console.error('Invalid type for STORAGE_DIRS:', type, 'dirKey:', dirKey);
+            return res.status(400).json({ success: false, error: `Invalid media type: ${type}` });
+        }
+
         // Get current date for directory structure
         const now = new Date();
         const year = now.getFullYear();
         const month = String(now.getMonth() + 1).padStart(2, '0');
-        const dateDir = path.join(STORAGE_DIRS[type], year.toString(), month);
+        const dateDir = path.join(STORAGE_DIRS[dirKey], year.toString(), month);
+
+        console.log('Storage directory:', dateDir);
 
         if (!fs.existsSync(dateDir)) {
             fs.mkdirSync(dateDir, { recursive: true });
@@ -237,7 +311,10 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
 
         const filename = `${uuidv4()}${path.extname(file.originalname)}`;
         const filepath = path.join(dateDir, filename);
-        const fileUrl = `/media/${type}/${year}/${month}/${filename}`;
+        const fileUrl = `/media/${dirKey}/${year}/${month}/${filename}`;
+
+        console.log('File will be saved to:', filepath);
+        console.log('File URL will be:', fileUrl);
 
         let mediaData = {
             mimeType: file.mimetype,
@@ -246,13 +323,14 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
 
         // Process based on type
         if (type === 'image') {
+            console.log('Processing image upload...');
             // Save and generate thumbnail
             await sharp(file.buffer).toFile(filepath);
 
             // Generate thumbnail
             const thumbFilename = `${path.parse(filename).name}_thumb${path.extname(filename)}`;
             const thumbPath = path.join(dateDir, thumbFilename);
-            const thumbUrl = `/media/${type}/${year}/${month}/${thumbFilename}`;
+            const thumbUrl = `/media/${dirKey}/${year}/${month}/${thumbFilename}`;
 
             await sharp(file.buffer)
                 .resize(300, 300, { fit: 'cover' })
@@ -261,6 +339,8 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
             const metadata = await sharp(file.buffer).metadata();
             mediaData.width = metadata.width;
             mediaData.height = metadata.height;
+
+            console.log('Image uploaded successfully:', fileUrl);
 
             return res.json({
                 success: true,
@@ -274,12 +354,15 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
                 }
             });
         } else if (type === 'video') {
+            console.log('Processing video upload...');
             // For video, just save for now (in production would transcode)
             fs.writeFileSync(filepath, file.buffer);
 
             mediaData.duration = 0; // Would extract actual duration in production
 
-            return res.json({
+            console.log('Video uploaded successfully:', fileUrl);
+
+            const responseData = {
                 success: true,
                 data: {
                     url: fileUrl,
@@ -288,10 +371,16 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
                     size: file.size,
                     duration: 0
                 }
-            });
+            };
+
+            console.log('Sending video response:', JSON.stringify(responseData));
+            return res.json(responseData);
         } else if (type === 'voice' || type === 'document') {
+            console.log(`Processing ${type} upload...`);
             // Save file
             fs.writeFileSync(filepath, file.buffer);
+
+            console.log(`${type} uploaded successfully:`, fileUrl);
 
             return res.json({
                 success: true,
@@ -301,10 +390,16 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
                     size: file.size
                 }
             });
+        } else {
+            return res.status(400).json({ 
+                success: false, 
+                error: `Unsupported media type: ${type}` 
+            });
         }
 
     } catch (error) {
         console.error('Upload error:', error);
+        console.error('Error stack:', error.stack);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -316,6 +411,8 @@ app.get('/api/conversations/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
 
+        console.log('Fetching conversations for user:', userId);
+
         const [conversations] = await db.execute(`
             SELECT 
                 c.id,
@@ -325,19 +422,35 @@ app.get('/api/conversations/:userId', async (req, res) => {
                 c.last_message_content,
                 c.last_message_at,
                 c.last_message_sender_id,
+                c.created_at,
                 (SELECT COUNT(*) FROM ripplevids_messages 
-                 WHERE conversation_id = c.id AND id NOT IN 
+                 WHERE conversation_id = c.id AND sender_id != ? AND id NOT IN 
                  (SELECT message_id FROM message_reads WHERE user_id = ?)
                 ) as unread_count,
-                GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN cp.user_id END) as other_user_ids
+                GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN u.username END) as other_usernames,
+                GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN u.profile_pic_url END) as other_profile_pics,
+                GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN cp.user_id END) as other_user_ids,
+                COUNT(DISTINCT u.id) as valid_users_count
             FROM conversations c
             JOIN conversation_participants cp ON c.id = cp.conversation_id
-            WHERE cp.user_id = ? AND cp.is_archived = FALSE
+            LEFT JOIN users u ON cp.user_id = u.id
+            WHERE c.id IN (
+                SELECT conversation_id FROM conversation_participants WHERE user_id = ?
+            )
             GROUP BY c.id
-            ORDER BY c.last_message_at DESC
-        `, [userId, userId, userId]);
+            HAVING valid_users_count >= 2
+            ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
+        `, [userId, userId, userId, userId, userId, userId]);
 
-        res.json(conversations);
+        console.log(`Found ${conversations.length} valid conversations`);
+
+        // Remove the valid_users_count field from response
+        const cleanedConversations = conversations.map(conv => {
+            const { valid_users_count, ...rest } = conv;
+            return rest;
+        });
+
+        res.json(cleanedConversations);
     } catch (error) {
         console.error('Error fetching conversations:', error);
         res.status(500).json({ error: 'Failed to fetch conversations' });
@@ -608,7 +721,15 @@ io.on('connection', (socket) => {
             // Verify authorization
             await canSendMessage(senderId, roomId);
 
-            const message = await saveMessage(roomId, senderId, body, type, null, null, replyToMessageId);
+            const message = await saveMessage(
+                roomId, 
+                senderId, 
+                body || '', 
+                type, 
+                null, 
+                null, 
+                replyToMessageId || null
+            );
 
             const messageObj = {
                 id: message.id,
@@ -617,7 +738,7 @@ io.on('connection', (socket) => {
                 body: message.body,
                 type: message.type,
                 created_at: message.created_at,
-                reply_to_message_id: replyToMessageId
+                reply_to_message_id: replyToMessageId || null
             };
 
             io.to(`room:${roomId}`).emit('new_message', messageObj);
@@ -631,7 +752,7 @@ io.on('connection', (socket) => {
             participants.forEach(p => {
                 io.to(`user:${p.user_id}`).emit('chat_list_update', {
                     conversation_id: roomId,
-                    last_message: body,
+                    last_message: body || '',
                     sender_id: senderId,
                     updated_at: new Date()
                 });
@@ -654,7 +775,15 @@ io.on('connection', (socket) => {
 
             await canSendMessage(senderId, roomId);
 
-            const message = await saveMessage(roomId, senderId, body || '[Media]', type, mediaUrl, mediaData, replyToMessageId);
+            const message = await saveMessage(
+                roomId, 
+                senderId, 
+                body || '[Media]', 
+                type, 
+                mediaUrl, 
+                mediaData || null, 
+                replyToMessageId || null
+            );
 
             const messageObj = {
                 id: message.id,
@@ -716,18 +845,31 @@ io.on('connection', (socket) => {
                 SELECT 
                     c.*,
                     (SELECT COUNT(*) FROM ripplevids_messages 
-                     WHERE conversation_id = c.id AND id NOT IN 
+                     WHERE conversation_id = c.id AND sender_id != ? AND id NOT IN 
                      (SELECT message_id FROM message_reads WHERE user_id = ?)
                     ) as unread_count,
-                    GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN cp.user_id END) as other_user_ids
+                    GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN u.username END) as other_usernames,
+                    GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN u.profile_pic_url END) as other_profile_pics,
+                    GROUP_CONCAT(DISTINCT CASE WHEN cp.user_id != ? THEN cp.user_id END) as other_user_ids,
+                    COUNT(DISTINCT u.id) as valid_users_count
                 FROM conversations c
                 JOIN conversation_participants cp ON c.id = cp.conversation_id
-                WHERE cp.user_id = ? AND cp.is_archived = FALSE
+                LEFT JOIN users u ON cp.user_id = u.id
+                WHERE c.id IN (
+                    SELECT conversation_id FROM conversation_participants WHERE user_id = ?
+                )
                 GROUP BY c.id
-                ORDER BY c.last_message_at DESC
-            `, [userId, userId, userId]);
+                HAVING valid_users_count >= 2
+                ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
+            `, [userId, userId, userId, userId, userId, userId]);
 
-            socket.emit('conversations', { conversations });
+            // Remove the valid_users_count field from response
+            const cleanedConversations = conversations.map(conv => {
+                const { valid_users_count, ...rest } = conv;
+                return rest;
+            });
+
+            socket.emit('conversations', { conversations: cleanedConversations });
         } catch (error) {
             console.error('Error getting conversations:', error);
             socket.emit('error', { message: 'Failed to fetch conversations' });

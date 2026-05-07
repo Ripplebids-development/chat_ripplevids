@@ -104,3 +104,26 @@ CREATE TABLE IF NOT EXISTS rooms (
     UNIQUE KEY unique_participants (participant1, participant2),
     INDEX idx_last_message_at (last_message_at)
 );
+
+-- Alter existing tables to add missing columns
+-- ALTER TABLE ripplevids_messages CHANGE COLUMN room_id conversation_id CHAR(36) NOT NULL; -- Already applied
+-- ALTER TABLE ripplevids_messages ADD COLUMN type VARCHAR(50) DEFAULT 'text'; -- Already applied
+-- ALTER TABLE ripplevids_messages ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+-- ALTER TABLE ripplevids_messages ADD COLUMN deleted_at TIMESTAMP NULL;
+-- ALTER TABLE ripplevids_messages ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE;
+-- ALTER TABLE ripplevids_messages ADD COLUMN reply_to_message_id CHAR(36);
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_url TEXT;
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_thumbnail_url TEXT;
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_type VARCHAR(100);
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_size_bytes BIGINT;
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_duration_seconds INT;
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_width INT;
+-- ALTER TABLE ripplevids_messages ADD COLUMN media_height INT;
+-- ALTER TABLE ripplevids_messages ADD COLUMN metadata JSON;
+-- Note: Foreign keys commented out due to existing data constraints
+-- ALTER TABLE ripplevids_messages ADD FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE;
+-- ALTER TABLE ripplevids_messages ADD FOREIGN KEY (reply_to_message_id) REFERENCES ripplevids_messages(id) ON DELETE SET NULL;
+ALTER TABLE ripplevids_messages ADD INDEX idx_messages_conversation (conversation_id, created_at DESC);
+ALTER TABLE ripplevids_messages ADD INDEX idx_messages_sender (sender_id);
+ALTER TABLE ripplevids_messages ADD INDEX idx_messages_created (created_at DESC);
+ALTER TABLE ripplevids_messages ADD INDEX idx_messages_reply (reply_to_message_id);
