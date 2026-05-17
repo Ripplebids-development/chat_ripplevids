@@ -62,8 +62,8 @@ const fileFilter = (req, file, cb) => {
         // Audio/Voice
         'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/webm',
         // Documents
-        'application/pdf', 
-        'application/msword', 
+        'application/pdf',
+        'application/msword',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         'application/vnd.ms-excel',
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -149,19 +149,19 @@ async function saveMessage(conversationId, senderId, body, type = 'text', mediaU
              media_duration_seconds, media_width, media_height, metadata, reply_to_message_id) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                messageId, 
-                conversationId, 
-                senderId, 
-                body || '', 
-                type, 
-                createdAt, 
-                mediaUrl || null, 
-                mediaData?.mimeType || null, 
-                mediaData?.size || null, 
-                mediaData?.duration || null, 
-                mediaData?.width || null, 
-                mediaData?.height || null, 
-                JSON.stringify(metadata), 
+                messageId,
+                conversationId,
+                senderId,
+                body || '',
+                type,
+                createdAt,
+                mediaUrl || null,
+                mediaData?.mimeType || null,
+                mediaData?.size || null,
+                mediaData?.duration || null,
+                mediaData?.width || null,
+                mediaData?.height || null,
+                JSON.stringify(metadata),
                 replyToMessageId || null
             ]
         );
@@ -232,7 +232,140 @@ async function canSendMessage(userId, conversationId) {
     }
 }
 
+async function triggerChatNotification(roomId, senderId, body, isAttachment = false) {
+    try {
+        console.log(`[Notification Trigger] Starting for roomId: ${roomId}, senderId: ${senderId}, isAttachment: ${isAttachment}`);
+
+        // 1. Get recipient user_id (the participant who is NOT the sender)
+        const [participants] = await db.execute(
+            'SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ?',
+            [roomId, senderId]
+        );
+
+        if (participants.length === 0) {
+            console.log(`[Notification Trigger] No other participant found in conversation: ${roomId}`);
+            return;
+        }
+        const recipientId = participants[0].user_id;
+
+        // 2. Get sender username
+        const [senderRow] = await db.execute(
+            'SELECT username FROM users WHERE id = ?',
+            [senderId]
+        );
+        const senderUsername = senderRow.length > 0 ? senderRow[0].username : 'Someone';
+
+        // 3. Build notification payload
+        let notifTitle = senderUsername;
+        let notifBody = body;
+
+        if (isAttachment) {
+            notifTitle = "New Attachment";
+            notifBody = `${senderUsername} sent you an attachment.`;
+        }
+
+        const payload = {
+            user_id: recipientId,
+            title: notifTitle,
+            body: notifBody,
+            conversation_id: roomId,
+            sender_id: senderId,
+            actor_username: senderUsername
+        };
+
+        // 4. Send POST to Flask API
+        const flaskUrl = 'https://uploader.ripplebids.com';
+        console.log(`[Notification Trigger] Dispatching asynchronously to Flask at ${flaskUrl}/notifications/chat-reply...`);
+
+        // Asynchronous non-blocking Axios call
+        axios.post(`${flaskUrl}/notifications/chat-reply`, payload)
+            .then(response => {
+                console.log(`[Notification Trigger] Success! Flask response:`, response.data);
+            })
+            .catch(error => {
+                console.error(`[Notification Trigger] Failed to send push notification via Flask: ${error.message}`);
+                if (error.response) {
+                    console.error(`[Notification Trigger] Flask error details:`, error.response.data);
+                }
+            });
+
+    } catch (error) {
+        console.error('[Notification Trigger] Exception occurred:', error);
+    }
+}
+
 // REST API Routes
+
+/**
+ * Create message via REST API (e.g. from inline notification reply in Flask)
+ */
+app.post('/api/chat/messages', async (req, res) => {
+    try {
+        const { conversationId, senderId, body, type = 'text', mediaUrl = null, mediaData = null, replyToMessageId = null } = req.body;
+
+        console.log(`[API Message] Received message for conv: ${conversationId}, sender: ${senderId}`);
+
+        if (!conversationId || !senderId || (!body && !mediaUrl)) {
+            return res.status(400).json({ success: false, error: 'Missing conversationId, senderId, or body/mediaUrl' });
+        }
+
+        // Verify authorization (participants/blocks)
+        await canSendMessage(senderId, conversationId);
+
+        // Save message to database & update conversation last message
+        const message = await saveMessage(
+            conversationId,
+            senderId,
+            body || '',
+            type,
+            mediaUrl,
+            mediaData,
+            replyToMessageId
+        );
+
+        const messageObj = {
+            id: message.id,
+            conversation_id: conversationId,
+            sender_id: senderId,
+            body: message.body,
+            type: message.type,
+            media_url: message.media_url || null,
+            media_type: message.media_type || null,
+            created_at: message.created_at,
+            reply_to_message_id: replyToMessageId || null
+        };
+
+        // Broadcast to WebSocket clients currently in the room
+        io.to(`room:${conversationId}`).emit('new_message', messageObj);
+
+        // Notify other user in conversation to update their active chats list
+        const [participants] = await db.execute(
+            'SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ?',
+            [conversationId, senderId]
+        );
+
+        participants.forEach(p => {
+            io.to(`user:${p.user_id}`).emit('chat_list_update', {
+                conversation_id: conversationId,
+                last_message: body || '[Media]',
+                sender_id: senderId,
+                updated_at: new Date()
+            });
+        });
+
+        // Trigger push notification to recipient asynchronously
+        triggerChatNotification(conversationId, senderId, body || '[Media]', false);
+
+        return res.json({
+            success: true,
+            message: messageObj
+        });
+
+    } catch (error) {
+        console.error('[API Message] Error:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
 
 /**
  * Upload Media Endpoint - Stores files locally and saves URL to database
@@ -391,9 +524,9 @@ app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
                 }
             });
         } else {
-            return res.status(400).json({ 
-                success: false, 
-                error: `Unsupported media type: ${type}` 
+            return res.status(400).json({
+                success: false,
+                error: `Unsupported media type: ${type}`
             });
         }
 
@@ -722,12 +855,12 @@ io.on('connection', (socket) => {
             await canSendMessage(senderId, roomId);
 
             const message = await saveMessage(
-                roomId, 
-                senderId, 
-                body || '', 
-                type, 
-                null, 
-                null, 
+                roomId,
+                senderId,
+                body || '',
+                type,
+                null,
+                null,
                 replyToMessageId || null
             );
 
@@ -758,6 +891,9 @@ io.on('connection', (socket) => {
                 });
             });
 
+            // Trigger push notification asynchronously in a non-blocking fashion
+            triggerChatNotification(roomId, senderId, body, false);
+
         } catch (error) {
             console.error('Error sending message:', error);
             socket.emit('error', { message: 'Failed to send message' });
@@ -776,12 +912,12 @@ io.on('connection', (socket) => {
             await canSendMessage(senderId, roomId);
 
             const message = await saveMessage(
-                roomId, 
-                senderId, 
-                body || '[Media]', 
-                type, 
-                mediaUrl, 
-                mediaData || null, 
+                roomId,
+                senderId,
+                body || '[Media]',
+                type,
+                mediaUrl,
+                mediaData || null,
                 replyToMessageId || null
             );
 
@@ -811,6 +947,9 @@ io.on('connection', (socket) => {
                     updated_at: new Date()
                 });
             });
+
+            // Trigger push notification for attachment asynchronously in a non-blocking fashion
+            triggerChatNotification(roomId, senderId, body || '[Media]', true);
 
         } catch (error) {
             console.error('Error sending media message:', error);
