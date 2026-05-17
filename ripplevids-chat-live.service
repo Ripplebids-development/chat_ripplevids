@@ -1,0 +1,32 @@
+[Unit]
+Description=RippleVids Livestream Chat WebSocket Service
+After=network.target mysql.service
+
+[Service]
+Type=simple
+# Best practice is to run under a non-root user (e.g., ubuntu, node, or www-data)
+# Change User and Group if your deployment user is different
+User=root
+Group=root
+
+# Change this to the absolute path of your project directory on the Linux server
+WorkingDirectory=/var/www/chat_ripplevids
+
+# Path to node executable (run 'which node' on server to confirm, usually /usr/bin/node or /usr/local/bin/node)
+ExecStart=/usr/bin/node server_live.js
+
+# Keep-alive configurations
+Restart=on-failure
+RestartSec=5s
+
+# Environment variables
+Environment=NODE_ENV=production
+Environment=PORT_LIVE=3990
+
+# Standard output and error logging settings
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=ripplevids-chat-live
+
+[Install]
+WantedBy=multi-user.target
